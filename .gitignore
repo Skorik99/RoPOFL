@@ -1,0 +1,6 @@
+**/outputs/
+*.egg-info
+__pycache__/
+**/food101/
+**/cifar100/
+venv/
