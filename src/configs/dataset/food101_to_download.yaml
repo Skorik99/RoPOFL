@@ -1,0 +1,7 @@
+_target_: federated_datasets.food101_dataset.Food101Dataset
+base_path: data
+data_sources:
+  test_map_file: null
+  train_map_file: null
+max_samples: null
+mode: train

@@ -1,0 +1,9 @@
+_target_: federated_methods.fine_tuning.fine_tuning.FineTuning
+ckpt_path: null
+server_test: False
+freeze_head: null
+freeze_backbone: null
+freeze_backbone_blocks: null
+best_metric: loss
+validate_per_epoch: True
+use_best_weights: True

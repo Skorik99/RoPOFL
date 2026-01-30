@@ -1,0 +1,3 @@
+_target_: attack_clients.LabelShiftClient
+percent_of_changed_labels: 1.0
+shift_size: 1

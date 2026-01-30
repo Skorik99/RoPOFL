@@ -1,0 +1,17 @@
+_target_: federated_methods.RoPO.ropo.RoPO
+strategy: base # base, sharded, filter. See strategy.py for details
+ckpt_path: null
+server_test: False
+beta: 0.5
+C: 0.1
+theta: 0.5
+num_local_iters: 8
+theta_decay: 0.5
+global_decay: False
+sgd_correction: True
+num_steps_to_agg: 1
+start_steps_to_agg: 1
+warmup_rounds: 0
+similarity_by_head: False
+freeze_vit_head: null
+print_trial_scores: True

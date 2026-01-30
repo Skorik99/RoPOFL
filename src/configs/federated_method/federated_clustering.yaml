@@ -1,0 +1,12 @@
+_target_: federated_methods.federated_clustering.federated_clustering.FederatedClustering
+strategy: base # base, sharded, filter. See strategy.py for details
+ckpt_path: null
+server_test: False
+K: 2
+tau_percentile: 0.2
+clustering_iters: 3
+alpha: 0.5
+num_local_iters: 1
+eta: 0.1
+warmup_rounds: 0
+debug: true

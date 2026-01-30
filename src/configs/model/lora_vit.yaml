@@ -1,0 +1,4 @@
+_target_: utils.model_utils.LoraVIT
+num_classes: 101
+r: 16
+head_freeze: True
