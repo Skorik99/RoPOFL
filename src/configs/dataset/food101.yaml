@@ -2,8 +2,8 @@ _target_: federated_datasets.food101_dataset.Food101Dataset
 base_path: data
 data_sources:
   train_map_file:
-    - /data/image_data/food101/image_data/food101_train.csv
+    - null
   test_map_file:
-    - /data/image_data/food101/image_data/food101_test_map_file.csv
+    - null
 mode: train
 max_samples: null

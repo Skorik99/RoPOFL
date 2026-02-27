@@ -2,7 +2,7 @@ _target_: federated_datasets.cifar100_dataset.Cifar100Dataset
 base_path: home
 data_sources:
   test_map_file:
-  - /home/skorik/RoPOFL/cifar100/images/test_map_file.csv
+  - null
   train_map_file:
-  - /home/skorik/RoPOFL/cifar100/images/train_map_file.csv
+  - null
 mode: train
