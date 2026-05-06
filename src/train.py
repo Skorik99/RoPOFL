@@ -19,6 +19,9 @@ def train(cfg: DictConfig):
     )
     trainer = client_selector(trainer)
 
+    attack_method = instantiate(cfg.attacks, cfg=trainer.cfg, _recursive_=False)
+    trainer = attack_method(trainer)
+
     trainer.begin_train()
 
 

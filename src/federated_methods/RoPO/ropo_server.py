@@ -1,9 +1,16 @@
 from collections import OrderedDict
 import os
-import torch
+
 import pandas as pd
+import torch
 
 from ..personalized.server import PerServer
+from .utils import (
+    build_trial_scores_matrix,
+    is_head_param,
+    pretty_print_trial_scores,
+    should_exclude_head_updates,
+)
 
 
 class RoPOServer(PerServer):
@@ -26,16 +33,17 @@ class RoPOServer(PerServer):
         self.similarity_by_head = similarity_by_head
         self.freeze_vit_head = freeze_vit_head
         self.print_trial_scores = print_trial_scores
-        self._exclude_head_updates = self._should_exclude_head_updates()
+        self._exclude_head_updates = should_exclude_head_updates(
+            self.cfg, self.freeze_vit_head
+        )
         self._similarity_matrix = None
         self._score_matrix = None
+        self.trust_scores = None
 
     def save_best_model(self, cur_round):
-        # We do not save best model for RoPO as we do not have a global model
         pass
 
     def set_client_result(self, client_result):
-        # Strip buffer entries from byzantine gradients to keep shapes consistent
         if client_result["rank"] in self.byzt_clients:
             param_names = {name for name, _ in self.global_model.named_parameters()}
             client_result["grad"] = OrderedDict(
@@ -43,14 +51,11 @@ class RoPOServer(PerServer):
             )
 
         super().set_client_result(client_result)
-        assert (
-            "num_batches_tracked" not in client_result["grad"].keys()
-        ), f"Client {client_result['rank']} gradient keys: {client_result['grad'].keys()}"
         self.client_models[client_result["rank"]] = client_result["client_model"]
 
     def update_trial_map(self):
         if len(self.trial_scores_map[0]) == 0:
-            print(f"Set initial trial scores.")
+            print("Set initial trial scores.")
         for rank in range(self.amount_of_clients):
             if rank not in self.active_ranks:
                 continue
@@ -63,7 +68,6 @@ class RoPOServer(PerServer):
                         self.trial_scores_map[rank], self.cur_trial_map[rank]
                     )
                 ]
-            # print(f"Client {rank} trial scores: {self.trial_scores_map[rank]}")
         if self.print_trial_scores:
             self.pretty_print_trial_scores()
 
@@ -91,16 +95,16 @@ class RoPOServer(PerServer):
             reference_params = [
                 (name, param)
                 for name, param in reference_params
-                if self._is_head_param(name)
+                if is_head_param(name)
             ]
             if not reference_params:
                 raise ValueError(
                     "similarity_by_head is True, but no head parameters were found."
                 )
+
         flat_grads = []
         for rank in self.active_ranks:
             grad = self.client_gradients[rank]
-            # Flatten each client's gradient in a consistent param order; fill missing with zeros
             pieces = []
             for name, param in reference_params:
                 tensor = grad.get(name)
@@ -111,13 +115,10 @@ class RoPOServer(PerServer):
         flat_grads = torch.stack(flat_grads)
 
         norms_sq = (flat_grads * flat_grads).sum(dim=1)
-        norms = torch.sqrt(norms_sq)
         similarity_matrix = flat_grads @ flat_grads.T
         threshold_matrix = self.C * norms_sq.unsqueeze(0)
         score_matrix = similarity_matrix - threshold_matrix
         score_matrix.fill_diagonal_(0)
-        # print("Similarity Clients matrix:")
-        # print(score_matrix)
         score_matrix = torch.where(
             score_matrix > 0, score_matrix, torch.zeros_like(score_matrix)
         )
@@ -155,11 +156,11 @@ class RoPOServer(PerServer):
 
             if sum_scores == 0:
                 self.make_corrections[rank] = False
-                if active_peers:
-                    uniform = 1 / len(active_peers)
-                    score_map = {peer: uniform for peer in active_peers}
-                else:
-                    score_map = {}
+                score_map = (
+                    {peer: 1 / len(active_peers) for peer in active_peers}
+                    if active_peers
+                    else {}
+                )
             else:
                 normalized_scores = (active_scores / sum_scores).tolist()
                 score_map = {
@@ -174,23 +175,6 @@ class RoPOServer(PerServer):
                 full_scores.append(score_map.get(other, 0.0))
             self.cur_trial_map[rank] = full_scores
         self.update_trial_map()
-
-    def _is_head_param(self, name):
-        head_keys = ("head", "linear", "fc", "classifier")
-        return any(
-            name == key or name.startswith(f"{key}.") or f".{key}." in name
-            for key in head_keys
-        )
-
-    def _should_exclude_head_updates(self):
-        target = getattr(self.cfg.model, "_target_", "") if self.cfg is not None else ""
-        is_lora = "LoraVIT" in str(target)
-        if not is_lora:
-            return False
-        if self.freeze_vit_head is None:
-            head_freeze = getattr(self.cfg.model, "head_freeze", True)
-            return not head_freeze
-        return not self.freeze_vit_head
 
     def _update_matrix_mean(self, matrix, filename):
         run_dir = getattr(self.cfg, "single_run_dir", None)
@@ -216,10 +200,8 @@ class RoPOServer(PerServer):
         torch.save(payload, path)
 
     def calculate_client_corrections(self):
-        # Calculate \sum_{m\neq i} \mathbb{1}_{<∇f_i, ∇f_m> > threshold} * w^t_{i,m} ∇f_m
         num_clients = self.amount_of_clients
         correction_map = {rank: None for rank in range(num_clients)}
-
         active_ranks = [
             rank for rank in range(num_clients) if self.make_corrections[rank]
         ]
@@ -230,7 +212,6 @@ class RoPOServer(PerServer):
         sample_grad = next(iter(self.client_gradients[sample_rank].values()))
         dtype = sample_grad.dtype
         device = sample_grad.device
-
         weights = torch.zeros((num_clients, num_clients), dtype=dtype, device=device)
 
         for rank in active_ranks:
@@ -242,7 +223,6 @@ class RoPOServer(PerServer):
             )
             active_mask = (current_scores != 0).to(dtype=dtype)
             filtered_scores = historical_scores * active_mask
-
             other_indices = list(range(rank)) + list(range(rank + 1, num_clients))
             if other_indices:
                 weights[rank, other_indices] = filtered_scores
@@ -250,24 +230,19 @@ class RoPOServer(PerServer):
         for rank in active_ranks:
             correction_map[rank] = OrderedDict()
 
-        for key in self.client_gradients[0].keys():
-            if self._exclude_head_updates and self._is_head_param(key):
+        for key in self.client_gradients[sample_rank].keys():
+            if self._exclude_head_updates and is_head_param(key):
                 for rank in active_ranks:
                     correction_map[rank][key] = torch.zeros_like(
                         self.client_gradients[rank][key]
                     )
                 continue
             stacked_grads = torch.stack(
-                [client_grad[key] for client_grad in self.client_gradients], dim=0
+                [self.client_gradients[rank][key] for rank in range(num_clients)], dim=0
             ).to(device=device)
             aggregated = torch.einsum("ij,j...->i...", weights, stacked_grads)
             for rank in active_ranks:
                 correction_map[rank][key] = aggregated[rank]
-
-        # for key in self.client_gradients[rank].keys():
-        #     print(
-        #         f"Client {rank} correction {key} norm: {torch.norm(correction_map[rank][key], p=2).item() if correction_map[rank] is not None else None}"
-        #     )
         return correction_map
 
     def set_client_corrections(self):
@@ -292,25 +267,43 @@ class RoPOServer(PerServer):
 
         device = sample_param.device
         dtype = sample_param.dtype
-
         weight_matrix = torch.zeros(
             (num_clients, num_clients), dtype=dtype, device=device
         )
 
-        for rank in range(num_clients):
-            weights = self.trial_scores_map[rank]
-            if not weights:
-                continue
-            other_indices = [idx for idx in range(num_clients) if idx != rank]
-            if other_indices:
-                weight_tensor = torch.tensor(weights, dtype=dtype, device=device)
-                weight_matrix[rank, other_indices] = weight_tensor
+        if self.trust_scores is not None:
+            for rank in range(num_clients):
+                row_weights = self.trust_scores.get(str(rank))
+                if row_weights is None:
+                    weights = self.trial_scores_map[rank]
+                    if not weights:
+                        continue
+                    other_indices = [idx for idx in range(num_clients) if idx != rank]
+                    if other_indices:
+                        weight_tensor = torch.tensor(weights, dtype=dtype, device=device)
+                        weight_matrix[rank, other_indices] = weight_tensor
+                else:
+                    ordered_weights = [
+                        float(row_weights.get(other_rank, 0.0))
+                        for other_rank in range(num_clients)
+                    ]
+                    weight_matrix[rank] = torch.tensor(
+                        ordered_weights, dtype=dtype, device=device
+                    )
+        else:
+            for rank in range(num_clients):
+                weights = self.trial_scores_map[rank]
+                if not weights:
+                    continue
+                other_indices = [idx for idx in range(num_clients) if idx != rank]
+                if other_indices:
+                    weight_tensor = torch.tensor(weights, dtype=dtype, device=device)
+                    weight_matrix[rank, other_indices] = weight_tensor
 
         updated_models = [OrderedDict() for _ in range(num_clients)]
-
         reference_keys = list(reference_model.keys())
         if self._exclude_head_updates:
-            head_keys = {name for name in reference_keys if self._is_head_param(name)}
+            head_keys = {name for name in reference_keys if is_head_param(name)}
             for rank in range(num_clients):
                 for name in head_keys:
                     if name in self.client_models[rank]:
@@ -329,97 +322,91 @@ class RoPOServer(PerServer):
             stacked_params = torch.stack(tensors, dim=0)
             if stacked_params.dtype != dtype:
                 stacked_params = stacked_params.to(dtype=dtype)
-            aggregated_params = torch.einsum(
-                "ij,j...->i...", weight_matrix, stacked_params
-            )
+            aggregated_params = torch.einsum("ij,j...->i...", weight_matrix, stacked_params)
             for rank in range(num_clients):
                 updated_models[rank][name] = aggregated_params[rank]
 
         self.client_models = updated_models
 
     def cleanup(self):
-        # Keep gradients for partial participation corrections; only reset metrics.
         self.server_metrics = [
             pd.DataFrame() for _ in range(self.cfg.federated_params.amount_of_clients)
         ]
 
-    def pretty_print_trial_scores(self, matrix=None, decimals=3, title=None):
+    def pretty_print_trial_scores(self, matrix=None, title=None):
         if matrix is None:
-            data = self._trial_scores_matrix()
-            hide_diagonal = True
-            title = title or "Client Trial Scores"
-        else:
-            data = self._ensure_square_tensor(matrix)
-            hide_diagonal = False
-            title = title or "Client Matrix"
-
-        num_clients = data.size(0)
-        print(f"{title}:")
-        if num_clients == 0:
-            print("  <empty>")
-            return
-
-        row_labels = [f"Client {i}" for i in range(num_clients)]
-        col_labels = row_labels
-        row_label_width = max(len("Client"), max(len(label) for label in row_labels))
-        col_width = max(len(label) for label in col_labels)
-
-        def render_value(row_idx, col_idx, value):
-            if hide_diagonal and row_idx == col_idx:
-                return "-"
-            if abs(value) < 1e-12:
-                return "0"
-            precision = (
-                decimals(value, row_idx, col_idx)
-                if callable(decimals)
-                else int(decimals)
+            matrix = build_trial_scores_matrix(
+                self.trial_scores_map, self.amount_of_clients
             )
-            return f"{value:.{precision}f}"
-
-        rendered_rows = []
-        for row_idx in range(num_clients):
-            rendered = []
-            for col_idx in range(num_clients):
-                value = data[row_idx, col_idx].item()
-                display = render_value(row_idx, col_idx, value)
-                col_width = max(col_width, len(display))
-                rendered.append(display)
-            rendered_rows.append(rendered)
-
-        header = f"{'Client':>{row_label_width}} | " + " ".join(
-            f"{label:>{col_width}}" for label in col_labels
+            title = title or "Client Trial Scores"
+        pretty_print_trial_scores(
+            self.amount_of_clients, self.trial_scores_map, matrix=matrix, title=title
         )
-        print(header)
-        for label, values in zip(row_labels, rendered_rows):
-            row = " ".join(f"{value:>{col_width}}" for value in values)
-            print(f"{label:>{row_label_width}} | {row}")
 
-    def _trial_scores_matrix(self):
-        num_clients = self.amount_of_clients
-        if num_clients == 0:
-            return torch.empty((0, 0), dtype=torch.float32)
+    def _print_score_matrix(self, title, matrix, ordered_columns, row_labels):
+        if not ordered_columns:
+            return
+        print(title)
+        chunk_size = 20
+        for start in range(0, len(ordered_columns), chunk_size):
+            chunk = ordered_columns[start : start + chunk_size]
+            header = "row   | " + " ".join(f"{rank:>7}" for rank in chunk)
+            print(header)
+            for row_label in row_labels:
+                values = " ".join(f"{matrix[row_label][rank]:>7.4f}" for rank in chunk)
+                print(f"{row_label:>4} | {values}")
 
-        matrix = torch.zeros((num_clients, num_clients), dtype=torch.float32)
-        for row in range(num_clients):
-            scores = self.trial_scores_map.get(row, [])
-            offset = 0
-            for col in range(num_clients):
-                if row == col:
-                    continue
-                value = scores[offset] if offset < len(scores) else 0.0
-                matrix[row, col] = value
-                offset += 1
-        return matrix
+    def _build_trust_score_matrix(
+        self, cosine_matrix, validator_ranks, source_ranks, threshold
+    ):
+        thresholded_matrix = {}
+        trust_score_matrix = {}
+        for validator_rank in validator_ranks:
+            cosines = torch.tensor(
+                [cosine_matrix[validator_rank, source_rank] for source_rank in source_ranks],
+                dtype=torch.float32,
+            )
+            masked = torch.where(cosines >= threshold, cosines, torch.zeros_like(cosines))
+            thresholded_matrix[str(validator_rank)] = {
+                source_rank: masked[idx].item()
+                for idx, source_rank in enumerate(source_ranks)
+            }
+            denom = masked.sum()
+            probs = masked / denom if denom.item() > 0 else torch.zeros_like(masked)
+            trust_score_matrix[str(validator_rank)] = {
+                source_rank: probs[idx].item()
+                for idx, source_rank in enumerate(source_ranks)
+            }
+        return thresholded_matrix, trust_score_matrix
 
-    @staticmethod
-    def _ensure_square_tensor(matrix):
-        if isinstance(matrix, torch.Tensor):
-            tensor = matrix.detach().cpu()
-        elif isinstance(matrix, (list, tuple)):
-            tensor = torch.tensor(matrix, dtype=torch.float32)
-        else:
-            raise TypeError("matrix must be a tensor or a nested list/tuple.")
-
-        if tensor.dim() != 2 or tensor.size(0) != tensor.size(1):
-            raise ValueError("matrix must be square.")
-        return tensor
+    def print_validator_debug(self, cosine_matrix, validator_ranks, threshold):
+        validator_ranks = list(validator_ranks)
+        source_ranks = list(range(self.amount_of_clients))
+        row_labels = [str(rank) for rank in validator_ranks]
+        cosine_matrix_dict = {
+            str(validator_rank): {
+                source_rank: cosine_matrix[validator_rank, source_rank].item()
+                for source_rank in source_ranks
+            }
+            for validator_rank in validator_ranks
+        }
+        thresholded_matrix, trust_score_matrix = self._build_trust_score_matrix(
+            cosine_matrix, validator_ranks, source_ranks, threshold
+        )
+        print(
+            f"\nValidation scores for round {getattr(self, 'cur_round', None)}: "
+            f"trust-score calculation with threshold={threshold}"
+        )
+        self._print_score_matrix(
+            "  Cosine similarity matrix:", cosine_matrix_dict, source_ranks, row_labels
+        )
+        self._print_score_matrix(
+            "  Thresholded cosine matrix:",
+            thresholded_matrix,
+            source_ranks,
+            row_labels,
+        )
+        self._print_score_matrix(
+            "  Trust-score matrix:", trust_score_matrix, source_ranks, row_labels
+        )
+        return trust_score_matrix

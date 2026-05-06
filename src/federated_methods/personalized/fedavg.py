@@ -1,5 +1,4 @@
 import torch
-from collections import OrderedDict
 
 from ..fedavg.fedavg import FedAvg
 from .client import PerClient
@@ -14,6 +13,10 @@ class PerFedAvg(FedAvg):
         self.ckpt_path = ckpt_path
         self.server_test = server_test
         super().__init__()
+        self._checkpoint_loaded = False
+        assert (
+            not self.server_test
+        ), "server_test is not supported for the current personalized transport path."
 
     def _init_client_cls(self):
         if (
@@ -59,13 +62,10 @@ class PerFedAvg(FedAvg):
         match self.strategy:
             case "sharded":
                 self.strategy = ShardedStrategy()
-
             case "base":
                 self.strategy = BaseStrategy()
-
             case "filter":
                 self.strategy = FilterStrategy()
-
             case _:
                 raise ValueError(f"No such cluster split type {self.strategy}")
 
@@ -79,12 +79,17 @@ class PerFedAvg(FedAvg):
         )["model"]
         self.server.global_model.load_state_dict(weights)
 
-    def get_communication_content(self, rank):
-        # Fine-tune option
-        if self.cur_round == 0 and self.ckpt_path is not None:
+    def build_serializable_content(self):
+        if (
+            self.cur_round == 0
+            and self.ckpt_path is not None
+            and not self._checkpoint_loaded
+        ):
             self.load_checkpoint()
+            self._checkpoint_loaded = True
+        return super().build_serializable_content()
 
-        # In we need additionaly send client cluster strategy
+    def get_communication_content(self, rank):
         content = super().get_communication_content(rank)
         content["strategy"] = self.strategy.get_client_payload(rank)
         return content
@@ -98,9 +103,7 @@ class PerFedAvg(FedAvg):
         return super().aggregate()
 
     def log_round(self):
-        # TODO: write log round for personalization strategies
         pass
 
     def cleanup(self):
-        # We clenup memory after test_global_model
         pass

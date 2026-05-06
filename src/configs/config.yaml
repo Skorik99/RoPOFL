@@ -6,6 +6,7 @@ defaults:
     - distribution: sharded
     - model_trainer: image
     - federated_method: fedavg
+    - attacks: base
     - client_selector: uniform
     - manager: base_manager
     - losses@loss: ce
@@ -26,6 +27,9 @@ federated_params:
     client_subset_size: 200 # How many clients do we select in each round
     communication_rounds: 1000
     local_epochs: 1
+    cache_client_state:
+        enabled: False
+        optimizer_state: True
     client_train_val_prop: 0.2
     print_client_metrics: False
     server_saving_metrics: ["loss"] # "loss", "Specificity", "Sensitivity", "G-mean", "f1-score", "fbeta2-score", "ROC-AUC", "AP", "Precision (PPV)", "NPV"

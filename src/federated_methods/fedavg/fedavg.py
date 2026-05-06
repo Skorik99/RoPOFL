@@ -8,6 +8,7 @@ from collections import OrderedDict
 from .fedavg_server import FedAvgServer
 from .fedavg_client import FedAvgClient
 
+from utils.caching_utils import serialize_payload
 from utils.attack_utils import (
     map_attack_clients,
     set_attack_rounds,
@@ -114,13 +115,20 @@ class FedAvg:
 
         return aggregated_weights
 
+    def build_serializable_content(self):
+        return {
+            "update_model": self.server.global_model.state_dict(),
+        }
+
+    def serialize_communication_content(self):
+        content = self.build_serializable_content()
+        return {key: serialize_payload(value) for key, value in content.items()}
+
     def get_communication_content(self, rank):
         # In fedavg we need to send model after aggregate and
         # attack type for every client
         return {
-            "update_model": {
-                k: v.cpu() for k, v in self.server.global_model.state_dict().items()
-            },
+            "serialized": self.serialized_content,
             "attack_type": (
                 self.client_map_round[rank],
                 self.attack_configs[self.client_map_round[rank]],
@@ -152,19 +160,19 @@ class FedAvg:
 
     def train_round(self):
         self.clients_loader = self.manager.create_batches(self.list_clients)
+        self.serialized_content = self.serialize_communication_content()
 
         for clients_batch in self.clients_loader:
-            print(f"Current batch of clients is {clients_batch}", flush=True)
             # Manager reinit clients with new ranks
             self.manager.set_ranks_to_procs(clients_batch)
 
             # Send content to clients to start local learning
-            for pipe_num, rank in enumerate(clients_batch):
+            for pipe_num, rank in clients_batch:
                 content = self.get_communication_content(rank)
                 self.server.send_content_to_client(pipe_num, content)
 
             # Waiting end of local learning and recieve content from clients
-            for pipe_num, rank in enumerate(clients_batch):
+            for pipe_num, rank in clients_batch:
                 content = self.server.rcv_content_from_client(pipe_num)
                 self.parse_communication_content(copy.deepcopy(content))
 

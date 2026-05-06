@@ -1,6 +1,8 @@
 import sys
 import copy
 import time
+import io
+import torch
 from collections import OrderedDict
 from utils.data_utils import get_dataset_loader
 from hydra.utils import instantiate
@@ -8,6 +10,8 @@ from hydra.utils import instantiate
 from utils.losses import get_loss
 from utils.attack_utils import add_attack_functionality
 from utils.process_utils import errors_child_handler
+from utils.caching_utils import resolve_enabled_cache_objects
+from utils.utils import tracked_state_items, get_tracked_model_state
 
 
 class FedAvgClient:
@@ -58,6 +62,21 @@ class FedAvgClient:
         self._init_optimizer()
         self._init_criterion()
         self.pipe_commands_map = self.create_pipe_commands()
+        self.cache_client_state = cfg.federated_params.cache_client_state.enabled
+        if self.cache_client_state:
+            self.clients_cache = client_kwargs.get("clients_cache", {})
+            self.temporary_cache_rank = client_kwargs.get("temporary_cache_rank", None)
+            self.cache_commands_map = self.create_cache_commands()
+            self.enabled_cache_objects, self.cache_commands_map = (
+                resolve_enabled_cache_objects(
+                    self.cache_commands_map,
+                    self.cfg.federated_params.cache_client_state,
+                    warning_key="fedavg_client",
+                )
+            )
+            self.pipe_commands_map["get_client_cache"] = self.get_client_cache
+            self.pipe_commands_map["set_client_cache"] = self.set_client_cache
+            self.restore_client_cache()
 
         self.grad = OrderedDict()
         self.local_epochs = self.cfg.federated_params.local_epochs
@@ -97,6 +116,9 @@ class FedAvgClient:
         kwargs["rank"] = new_rank
         kwargs["model"] = self.model
         kwargs["model_trainer"] = self.model_trainer
+        if self.cache_client_state:
+            kwargs["clients_cache"] = self.save_client_cache()
+            kwargs["temporary_cache_rank"] = self.temporary_cache_rank
         original_cls = self._original_cls
         self.__dict__.clear()
         original_cls.__init__(self, *args, **kwargs)
@@ -112,6 +134,7 @@ class FedAvgClient:
     def create_pipe_commands(self):
         # define a structure to process pipe values
         pipe_commands_map = {
+            "serialized": self.deserialize,
             "update_model": lambda state_dict: self.model.load_state_dict(
                 {k: v.to(self.device) for k, v in state_dict.items()}
             ),
@@ -122,21 +145,78 @@ class FedAvgClient:
 
         return pipe_commands_map
 
+    def create_cache_commands(self):
+        return {
+            "optimizer_state": lambda state_dict: self.optimizer.load_state_dict(
+                state_dict
+            ),
+        }
+
+    def create_client_cache(self):
+        return {
+            "optimizer_state": copy.deepcopy(self.optimizer.state_dict()),
+        }
+
+    def restore_client_cache(self):
+        self.clients_cache = self.client_kwargs.get("clients_cache", {})
+        if len(self.clients_cache) == 0:
+            self.clients_cache = {
+                rank: None for rank in range(self.cfg.federated_params.amount_of_clients)
+            }
+        client_state = self.clients_cache.get(self.rank)
+        if client_state is None:
+            return
+        for key, value in client_state.items():
+            if key in self.cache_commands_map:
+                self.cache_commands_map[key](value)
+            else:
+                raise ValueError(
+                    f"Recieved content in client {self.rank} from cache, with unknown key={key}"
+                )
+
+    def save_client_cache(self):
+        self.clients_cache[self.rank] = {
+            key: value
+            for key, value in self.create_client_cache().items()
+            if key in self.enabled_cache_objects
+        }
+        return self.clients_cache
+
+    def get_client_cache(self, rank):
+        response = copy.deepcopy(self.clients_cache[rank])
+        self.pipe.send(response)
+        content = self.pipe.recv()
+        self.parse_communication_content(content)
+
+    def set_client_cache(self, payload):
+        self.clients_cache[payload["rank"]] = copy.deepcopy(payload["cache"])
+        if self.temporary_cache_rank is not None:
+            self.clients_cache[self.temporary_cache_rank] = None
+        self.temporary_cache_rank = payload["rank"]
+        content = self.pipe.recv()
+        self.parse_communication_content(content)
+
+    def deserialize(self, serialized_content):
+        deserialized_content = {
+            key: torch.load(io.BytesIO(payload), map_location="cpu")
+            for key, payload in serialized_content.items()
+        }
+        self.parse_communication_content(deserialized_content)
+
     def get_loss_value(self, outputs, targets):
         return self.criterion(outputs, targets)
 
     def get_grad(self):
         self.model.eval()
-        for key, _ in self.model.state_dict().items():
-            self.grad[key] = (
-                self.model.state_dict()[key] - self.server_model_state[key]
-            ).to("cpu")
+        self.grad = OrderedDict()
+        for key, tensor in tracked_state_items(self.model):
+            self.grad[key] = tensor.detach().cpu() - self.server_model_state[key]
 
     def train(self):
         start = time.time()
 
         # Save the server model state to get_grad
-        self.server_model_state = copy.deepcopy(self.model).state_dict()
+        self.server_model_state = get_tracked_model_state(self.model)
 
         # Validate server weights before training to set up best model
         self.server_val_loss, self.server_metrics = self.model_trainer.client_eval_fn(

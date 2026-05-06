@@ -5,6 +5,7 @@ import pandas as pd
 from hydra.utils import instantiate
 
 from utils.data_utils import get_dataset_loader
+from utils.utils import tracked_state_items
 
 
 class AttackClient:
@@ -159,32 +160,39 @@ class AttackGradClient(AttackClient):
             AttackGradClient.get_grad, client_instance
         )
         client_instance.grad_attack = MethodType(self.grad_attack(), client_instance)
+        client_instance.load_corrupted_model = MethodType(
+            self.load_corrupted_model(), client_instance
+        )
         return client_instance
 
     def get_grad(self):
         print(f"Сейчас атакует клиент {self.rank}", flush=True)
         rng = np.random.RandomState(self.rank)
         self.model.eval()
+        self.grad = {}
         random_model = instantiate(
             self.cfg.model, num_classes=self.train_dataset.num_classes
         )
         self.random_weights = random_model.state_dict()
-        for name, param in self.model.named_parameters():
-            param_final_grad = param.data - self.server_model_state[name]
+        for name, tensor in tracked_state_items(self.model):
+            param_final_grad = tensor.detach().cpu() - self.server_model_state[name]
             param_final_grad_flat = param_final_grad.view(-1)
             self.flip_ids = rng.choice(
                 param_final_grad_flat.numel(),
                 int(param_final_grad_flat.numel() * self.percent_of_changed_grads),
                 replace=False,
             )
-            self.param = param
+            self.param = tensor
             self.name = name
             param_final_grad_flat[self.flip_ids] = self.grad_attack()
             self.grad[name] = param_final_grad_flat.view_as(param_final_grad).to("cpu")
-        for name, buffer in self.model.named_buffers():
-            self.grad[name] = buffer.to("cpu") - self.server_model_state[name].to("cpu")
+        if "pow" in self.cfg.client_selector._target_:
+            self.load_corrupted_model()
 
     def grad_attack(self):
+        raise NotImplementedError("Subclasses must implement this method")
+
+    def load_corrupted_model(self):
         raise NotImplementedError("Subclasses must implement this method")
 
 
@@ -194,11 +202,21 @@ class SignFlipClient(AttackGradClient):
             # Gradient Attacking with sign flipping
             return (
                 self.server_model_state[self.name].view(-1)[self.flip_ids]
-                - self.param.data.view(-1)[self.flip_ids]
+                - self.param.detach().cpu().view(-1)[self.flip_ids]
             )
 
         # This method returns a closure that dynamically adjusts the gradients for custom method
         return grad_flip
+
+    def load_corrupted_model(self):
+        def load_sign_flip_model(self):
+            self.model.eval()
+            loading_weights = self.model.state_dict()
+            for key, value in self.grad.items():
+                loading_weights[key] = self.server_model_state[key].to("cpu") - value
+            self.model.load_state_dict(loading_weights)
+
+        return load_sign_flip_model
 
 
 class RandomGradClient(AttackGradClient):
@@ -206,12 +224,22 @@ class RandomGradClient(AttackGradClient):
         def grad_random(self):
             # Gradient Attacking with randomization
             return (
-                self.random_weights[self.name].view(-1)[self.flip_ids].to(self.device)
+                self.random_weights[self.name].view(-1)[self.flip_ids].to("cpu")
                 - self.server_model_state[self.name].view(-1)[self.flip_ids]
             )
 
         # This method returns a closure that dynamically adjusts the gradients for custom method
         return grad_random
+
+    def load_corrupted_model(self):
+        def load_random_grad_model(self):
+            self.model.eval()
+            loading_weights = self.model.state_dict()
+            for key, value in self.grad.items():
+                loading_weights[key] = self.server_model_state[key].to("cpu") + value
+            self.model.load_state_dict(loading_weights)
+
+        return load_random_grad_model
 
 
 class IPM(AttackClient):

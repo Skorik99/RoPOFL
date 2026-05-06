@@ -1,0 +1,9 @@
+_target_: attacks.pfedba.pfedba_method.PFedBAMethod
+attack_client_cls: attacks.pfedba.pfedba_client.PFedBAClientAttack
+target_label: 0
+data_malicious_percent: 0.2
+trigger_lr: 0.01
+trigger_weight_decay: 0.0
+trigger_batch_size: 128
+trigger_steps_loss_align: 50
+trigger_steps_grad_align: 50

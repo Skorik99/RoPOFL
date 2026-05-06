@@ -1,0 +1,2 @@
+_target_: manager.batch_generator.cached.CachedBatchGenerator
+batch_size: 10

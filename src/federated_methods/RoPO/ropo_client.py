@@ -2,16 +2,20 @@ import copy
 import random
 import time
 from collections import OrderedDict
-import math
 
 import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 from ..personalized.client import PerClient
+from .utils import resolve_global_decay
+from utils.attack_utils import add_attack_functionality
+from utils.process_utils import errors_child_handler
+from utils.utils import get_tracked_model_state, tracked_named_parameters
 
 
 class RoPOClient(PerClient):
     def __init__(self, *client_args, **client_kwargs):
-        # self.client_args = client_args
         base_client_args = client_args[:2]
         super().__init__(*base_client_args, **client_kwargs)
         self.client_args = client_args
@@ -22,19 +26,39 @@ class RoPOClient(PerClient):
         self.sgd_correction = client_args[6] if len(client_args) > 6 else True
         self.use_global_decay = bool(self.global_decay_mode)
         self.global_decay = 1.0
-        assert (
-            self.num_local_iters > 0
-        ), f"num_local_iters must be positive, got {self.num_local_iters}"
+        assert self.num_local_iters > 0
         self.correction = None
         self.make_correction = False
-        self._debug_prefix = f"[Client {self.rank}]"
+        self.debug_loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.cfg.training_params.batch_size,
+            shuffle=False,
+            num_workers=0,
+            drop_last=False,
+        )
+        self._debug_reference_state = None
+        self._debug_reference_probs = None
 
     def create_pipe_commands(self):
         pipe_commands_map = super().create_pipe_commands()
         pipe_commands_map["correction"] = self.set_correction
         pipe_commands_map["client_model"] = self.set_client_model
+        pipe_commands_map["aggregated_local_model"] = self.set_aggregated_local_model
         pipe_commands_map["cur_round"] = self.set_round
+        pipe_commands_map["debug_validate_model"] = self.debug_validate_model
         return pipe_commands_map
+
+    def create_cache_commands(self):
+        cache_commands_map = super().create_cache_commands()
+        cache_commands_map["model_state"] = self.set_client_model
+        return cache_commands_map
+
+    def create_client_cache(self):
+        client_cache = super().create_client_cache()
+        client_cache["model_state"] = {
+            k: v.detach().cpu() for k, v in self.model.state_dict().items()
+        }
+        return client_cache
 
     def set_correction(self, correction):
         correction_state, self.make_correction = correction
@@ -50,75 +74,120 @@ class RoPOClient(PerClient):
             {k: v.to(self.device) for k, v in client_model.items()}
         )
 
+    def set_aggregated_local_model(self, client_model):
+        self.set_client_model(client_model)
+        if self.cache_client_state:
+            self.clients_cache[self.rank] = {
+                key: value
+                for key, value in self.create_client_cache().items()
+                if key in self.enabled_cache_objects
+            }
+
     def set_round(self, cur_round):
-        if not self.use_global_decay:
-            self.global_decay = 1.0
-            return
-        if cur_round is None or cur_round <= 0:
-            self.global_decay = 1.0
-            return
-        if self.global_decay_mode == "log":
-            decay = math.log10(cur_round + 1)
-            decay = decay if decay > 1.0 else 1.0
-            self.global_decay = 1.0 / decay
-        elif self.global_decay_mode is False:
-            self.global_decay = 1.0
-        else:
-            raise ValueError(f"Unsupported global_decay mode: {self.global_decay_mode}")
+        self.global_decay = resolve_global_decay(
+            cur_round, self.use_global_decay, self.global_decay_mode
+        )
+
+    def reinit_self(self, new_rank):
+        args = self.client_args
+        kwargs = self.client_kwargs
+        kwargs["rank"] = new_rank
+        kwargs["model"] = self.model
+        kwargs["model_trainer"] = self.model_trainer
+        if self.cache_client_state:
+            kwargs["clients_cache"] = self.save_client_cache()
+            kwargs["temporary_cache_rank"] = self.temporary_cache_rank
+        original_cls = self._original_cls
+        self.__dict__.clear()
+        original_cls.__init__(self, *args, **kwargs)
+
+    def get_client_cache(self, rank):
+        response = copy.deepcopy(self.clients_cache[rank])
+        self.pipe.send(response)
+
+    def set_client_cache(self, payload):
+        self.clients_cache[payload["rank"]] = copy.deepcopy(payload["cache"])
+        if self.temporary_cache_rank is not None:
+            self.clients_cache[self.temporary_cache_rank] = None
+        self.temporary_cache_rank = payload["rank"]
+
+    def _evaluate_model_probs_on_debug_loader(self, model_state=None):
+        if model_state is not None:
+            self.model.load_state_dict(
+                {k: v.to(self.device) for k, v in model_state.items()}
+            )
+        self.model.eval()
+        probs_list = []
+        with torch.no_grad():
+            for _, (inputs, _targets) in self.debug_loader:
+                inp = inputs[0].to(self.device)
+                outputs = self.model(inp)
+                probs_list.append(F.softmax(outputs, dim=-1).detach().cpu())
+        return torch.cat(probs_list, dim=0)
+
+    def debug_validate_model(self, payload):
+        source_rank = int(payload["source_rank"])
+        model_state = payload["model_state"]
+        if self._debug_reference_state is None:
+            self._debug_reference_state = {
+                k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
+            }
+        if self._debug_reference_probs is None:
+            self._debug_reference_probs = self._evaluate_model_probs_on_debug_loader()
+
+        candidate_probs = self._evaluate_model_probs_on_debug_loader(model_state)
+        cosine = (
+            F.cosine_similarity(candidate_probs, self._debug_reference_probs, dim=1)
+            .mean()
+            .item()
+        )
+        self.model.load_state_dict(
+            {k: v.to(self.device) for k, v in self._debug_reference_state.items()}
+        )
+        return {
+            "validator_rank": self.rank,
+            "source_rank": source_rank,
+            "cosine": cosine,
+        }
 
     def _decayed_theta(self, local_step: int) -> float:
         return self.theta * (self.theta_decay**local_step) * self.global_decay
 
     def _apply_grad_correction(self, step_theta: float):
-        """Blend correction into gradients before optimizer.step (uses optimizer preconditioner)."""
         if not self.make_correction or step_theta == 0 or self.correction is None:
             return
 
         for name, param in self.model.named_parameters():
             if param.grad is None:
-                print(f"Client {self.rank} Param {name} grad is None, skip correction")
                 continue
-
             correction_tensor = self.correction.get(name)
             if correction_tensor is None:
-                assert (
-                    False
-                ), f"Client {self.rank} Param {name} correction is None, but original grad is not None"
-
+                raise AssertionError(
+                    f"Client {self.rank} param {name} has grad but no correction."
+                )
             if correction_tensor.device != param.grad.device:
                 correction_tensor = correction_tensor.to(param.grad.device)
-
-            theta_param = step_theta
-
             with torch.no_grad():
-                param.grad.mul_(1 - theta_param)
-                param.grad.add_(correction_tensor, alpha=theta_param)
+                param.grad.mul_(1 - step_theta)
+                param.grad.add_(correction_tensor, alpha=step_theta)
 
     def _apply_param_correction(self, step_theta: float):
-        """Apply correction directly in parameter space after optimizer.step (bypasses Adam moments)."""
         if not self.make_correction or step_theta == 0 or self.correction is None:
             return
 
         for name, param in self.model.named_parameters():
-            grad_tensor = param.grad
-            if grad_tensor is None:
-                # print(f"Client {self.rank} Param {name} grad is None, skip correction")
+            if param.grad is None:
                 continue
-
             correction_tensor = self.correction.get(name)
             if correction_tensor is None:
-                assert (
-                    False
-                ), f"Client {self.rank} Param {name} correction is None, but original grad is not None"
-
+                raise AssertionError(
+                    f"Client {self.rank} param {name} has grad but no correction."
+                )
             if correction_tensor.device != param.device:
                 correction_tensor = correction_tensor.to(param.device)
-
-            theta_param = step_theta
-
             lr = self.optimizer.param_groups[0].get("lr", 1.0)
             with torch.no_grad():
-                param.add_(correction_tensor, alpha=-theta_param * lr)
+                param.add_(correction_tensor, alpha=-step_theta * lr)
 
     def _choose_positions(self, total_batches: int):
         total_candidates = total_batches * max(1, self.local_epochs)
@@ -130,7 +199,6 @@ class RoPOClient(PerClient):
     def train_iter_fn(self, inputs, targets, step_theta: float):
         inp = inputs[0].to(self.device)
         targets = targets.to(self.device)
-
         self.optimizer.zero_grad()
         outputs = self.model(inp)
         loss = self.get_loss_value(outputs, targets)
@@ -144,12 +212,10 @@ class RoPOClient(PerClient):
 
     def train(self):
         start = time.time()
-        self.server_model_state = copy.deepcopy(self.model).state_dict()
+        self.server_model_state = get_tracked_model_state(self.model)
         self.server_val_loss, self.server_metrics = self.model_trainer.client_eval_fn(
             self
         )
-
-        # --- ITERATIVE TRAINING ---
         self.model.train()
         total_batches = len(self.train_loader)
         chosen_positions, steps_to_take = self._choose_positions(total_batches)
@@ -178,12 +244,10 @@ class RoPOClient(PerClient):
         self.model.eval()
         self.grad = OrderedDict()
         with torch.no_grad():
-            for name, param in self.model.named_parameters():
+            for name, param in tracked_named_parameters(self.model):
                 server_param = self.server_model_state[name].to(param.device)
                 update = param.data - server_param
                 self.grad[name] = update.detach().cpu()
-                # if torch.norm(update).item() != 0:
-                #     print(f"Client {self.rank}", name, torch.norm(update).item())
 
     def get_communication_content(self):
         result_dict = super().get_communication_content()
@@ -191,3 +255,33 @@ class RoPOClient(PerClient):
             k: v.clone().cpu() for k, v in self.model.state_dict().items()
         }
         return result_dict
+
+
+@errors_child_handler
+def ropo_multiprocess_client(*client_args, client_cls, pipe, rank, attack_type, **_kwargs):
+    client_kwargs = {"pipe": pipe, "rank": rank}
+    client = client_cls(*client_args, **client_kwargs)
+
+    while True:
+        content = client.pipe.recv()
+        if "debug_validate_model" in content:
+            response = client.debug_validate_model(content["debug_validate_model"])
+            client.pipe.send(response)
+            continue
+
+        client.parse_communication_content(content)
+        if (
+            "reinit" in content
+            or "get_client_cache" in content
+            or "set_client_cache" in content
+        ):
+            continue
+
+        if getattr(client, "attack_type", "no_attack") != "no_attack":
+            client = add_attack_functionality(
+                client, client.attack_type, client.attack_config
+            )
+
+        client.train()
+        response = client.get_communication_content()
+        client.pipe.send(response)

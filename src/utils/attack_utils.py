@@ -1,9 +1,13 @@
 import random
 import os
+import warnings
 import numpy as np
 from numpy.random import permutation
 from omegaconf import OmegaConf, ListConfig
 from hydra.utils import instantiate
+
+
+_ALIE_RANDOM_GRAD_WARNING_SHOWN = False
 
 
 def map_attack_clients(clients_attack_types, prop_attack_clients, num_of_clients):
@@ -190,6 +194,15 @@ def add_attack_functionality(client_instance, attack_type, attack_config):
 def apply_synchronized_attack(
     list_clients, client_gradients, client_map_round, attack_configs, global_model
 ):
+    def stack_client_grads(client_ids):
+        import torch
+
+        grad_keys = client_gradients[client_ids[0]].keys()
+        return {
+            k: torch.stack([client_gradients[i][k] for i in client_ids])
+            for k, _ in global_model.named_parameters()
+            if k in grad_keys
+        }
 
     def apply_ipm_attack(ipm_eps):
         import torch
@@ -210,9 +223,11 @@ def apply_synchronized_attack(
             return
 
         # set up true mean gradients
+        grad_keys = client_gradients[true_clients[0]].keys()
         byzantine_grad = {
             k: torch.stack([client_gradients[i][k] for i in true_clients]).mean(0)
             for k, _ in global_model.named_parameters()
+            if k in grad_keys
         }
         # set client byzantine gradients
         for k in byzantine_grad.keys():
@@ -263,32 +278,33 @@ def apply_synchronized_attack(
         z_score = find_max_z(cumulative_prob)
         print(f"z_score: {z_score}")
 
-        # Gradient communication with found z_score
-        import torch
-
-        # set up mean gradients
-        byzantine_grads = {
-            k: torch.stack([client_gradients[i][k] for i in byzantine_clients])
-            for k, _ in global_model.named_parameters()
-        }
+        byzantine_grads = stack_client_grads(byzantine_clients)
         mean_grads = {
             k: byzantine_grads[k].mean(0) if byzantine_grads[k].size(0) > 0 else 0.0
-            for k, _ in global_model.named_parameters()
+            for k in byzantine_grads.keys()
         }
 
         std_grads = {
             k: byzantine_grads[k].std(0) if byzantine_grads[k].size(0) > 1 else 0.0
-            for k, _ in global_model.named_parameters()
+            for k in byzantine_grads.keys()
         }
 
         # synchronized communication
         if backdoor_type == "random_grad":
-            alie_grads = {
-                k: mean + z_score * std
-                for (k, mean), (_, std) in zip(mean_grads.items(), std_grads.items())
-            }
-        else:
-            alie_grads = mean_grads
+            global _ALIE_RANDOM_GRAD_WARNING_SHOWN
+            if not _ALIE_RANDOM_GRAD_WARNING_SHOWN:
+                warnings.warn(
+                    "ALIE with attack_type='random_grad' computes mean/std over the Byzantine "
+                    "clients' already-randomized updates. This preserves the ALIE synchronization "
+                    "step but does not match the paper's backdoor logic.",
+                    stacklevel=2,
+                )
+                _ALIE_RANDOM_GRAD_WARNING_SHOWN = True
+
+        alie_grads = {
+            k: mean + z_score * std
+            for (k, mean), (_, std) in zip(mean_grads.items(), std_grads.items())
+        }
 
         # set up byzantine gradients
         for k, alie_grad in alie_grads.items():

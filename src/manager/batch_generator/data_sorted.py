@@ -25,7 +25,12 @@ class DataSortedBatchGenerator(Base):
         sorted_round_clients = [x for x in self.sorted_clients_idx if x in set_clients]
 
         self.batches = [
-            sorted_round_clients[i : i + self.batch_size]
+            [
+                (pipe_num, rank)
+                for pipe_num, rank in enumerate(
+                    sorted_round_clients[i : i + self.batch_size]
+                )
+            ]
             for i in range(0, len(sorted_round_clients), self.batch_size)
         ]
         self.num_batches = len(self.batches)

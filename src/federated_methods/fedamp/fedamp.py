@@ -1,7 +1,8 @@
-import copy
 import torch
 import torch.nn.functional as F
 import pandas as pd
+from utils.caching_utils import serialize_payload
+from utils.utils import tracked_state_items
 
 from ..personalized.fedavg import PerFedAvg
 from ..fedamp.fedamp_client import FedAMPClient
@@ -59,7 +60,27 @@ class FedAMP(PerFedAvg):
             self.server.list_clients = self.list_clients
         return super().train_round()
 
+    def _get_shared_gradient_keys(self):
+        tracked_keys = [
+            name for name, _ in tracked_state_items(self.server.global_model)
+        ]
+        shared_keys = []
+        for key in tracked_keys:
+            if all(
+                key in self.server.client_gradients[i]
+                for i in range(self.amount_of_clients)
+            ):
+                shared_keys.append(key)
+
+        if not shared_keys:
+            raise ValueError(
+                "FedAMP could not find any shared gradient keys across clients. "
+                "This usually means client updates use inconsistent state formats."
+            )
+        return shared_keys
+
     def define_aggregation_weights(self):
+        shared_keys = self._get_shared_gradient_keys()
         with torch.no_grad():
             clients_params_vectors = []
             for client_rank in range(self.cfg.federated_params.amount_of_clients):
@@ -70,8 +91,8 @@ class FedAMP(PerFedAvg):
                         "ensure warmup_rounds covers all clients."
                     )
                 parameter_list = [
-                    param.detach().cpu().flatten()
-                    for param in personalized_model.values()
+                    personalized_model[key].detach().cpu().flatten()
+                    for key in shared_keys
                 ]
                 vec = torch.cat(parameter_list)
                 clients_params_vectors.append(vec)
@@ -102,6 +123,7 @@ class FedAMP(PerFedAvg):
             return aggregation_weights
 
     def aggregate(self):
+        shared_keys = self._get_shared_gradient_keys()
         aggr_weights = self.define_aggregation_weights()
         global_model_state_dict = self.server.global_model.state_dict()
         n_clients = self.cfg.federated_params.amount_of_clients
@@ -111,7 +133,7 @@ class FedAMP(PerFedAvg):
             self.server.relative_models = [{} for _ in range(n_clients)]
             # Keep aggregation math on CPU to avoid extra GPU memory use
             aggr_weights_tensor = aggr_weights.to(dtype=torch.float32)
-            for key in global_model_state_dict.keys():
+            for key in shared_keys:
                 grad_stack = torch.stack(
                     [
                         self.server.client_gradients[i][key].detach().cpu()
@@ -132,35 +154,36 @@ class FedAMP(PerFedAvg):
 
         return global_model_state_dict
 
+    def serialize_communication_content(self):
+        if self.cur_round == 0:
+            init_state = self.server.global_model.state_dict()
+            serialized_init_state = serialize_payload(init_state)
+            return {
+                "update_model": serialized_init_state,
+                "relative_model": serialized_init_state,
+            }
+        return None
+
     def get_communication_content(self, rank):
-        # Don`t support finetuning by default
-        content = {
+        if self.cur_round == 0:
+            serialized = {
+                "update_model": self.serialized_content["update_model"],
+                "relative_model": self.serialized_content["update_model"],
+            }
+        else:
+            serialized = {
+                "update_model": serialize_payload(self.server.client_gradients[rank]),
+                "relative_model": serialize_payload(self.server.relative_models[rank]),
+            }
+
+        return {
+            "serialized": serialized,
             "attack_type": (
                 self.client_map_round[rank],
                 self.attack_configs[self.client_map_round[rank]],
             ),
             "strategy": self.strategy.get_client_payload(rank),
-            # Send the same client model back, expect first round
-            "update_model": {
-                k: v.cpu()
-                for k, v in (
-                    self.server.client_gradients[rank].items()
-                    if self.cur_round != 0
-                    else self.server.global_model.state_dict().items()
-                )
-            },
-            # Also send an aggregated model relative to other clients, expect first round
-            "relative_model": {
-                k: v.cpu()
-                for k, v in (
-                    self.server.relative_models[rank].items()
-                    if self.cur_round != 0
-                    else self.server.global_model.state_dict().items()
-                )
-            },
         }
-
-        return content
 
     def softmax(self, x, axis=1):
         if self.self_value is None:

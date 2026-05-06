@@ -38,22 +38,13 @@ manager.batch_generator.batch_size=20 training_params.device_ids=[0] \
 * `manager.batch_size` client processes will be created (higher performance, more resources required). To forcefully terminate the training, kill any of the processes.
 * For more details see [Config Explaining](docs/config.md)
 
-#### 🌪️ RoPO on Block-Sharded CIFAR-100
-
-```bash
-python src/train.py \
-federated_method=RoPO federated_method.strategy=sharded \
-federated_method.C=0.035 federated_method.beta=0.99 federated_method.theta=0.5 \
-manager.batch_generator.batch_size=20 training_params.device_ids=[0] \
-> RoPO_cifar100_block_sharded_200_clients.txt 
-```
-
 #### 🦠 Byzantine Attacks 
 
 **RoPO with Random Gradient Attack**
 
 ```bash
 python src/train.py \
+  federated_method=RoPO federated_method.strategy=sharded \
   training_params.batch_size=32 \
   federated_params.print_client_metrics=False \
   federated_params.clients_attack_types=random_grad \

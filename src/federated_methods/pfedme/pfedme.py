@@ -38,9 +38,13 @@ class pFedMe(Ditto):
             )
 
             for rank in self.list_clients:
-                client_delta = self.server.client_gradients[rank][key].to(
-                    self.server.device
-                )
+                client_delta = self.server.client_gradients[rank].get(key)
+                if client_delta is None:
+                    client_delta = torch.zeros_like(
+                        aggregated_weights[key], device=self.server.device
+                    )
+                else:
+                    client_delta = client_delta.to(self.server.device)
                 delta_sum += client_delta.float() / num_clients
 
             # Apply momentum: w_k = w_{k-1} + β * avg_delta (equal paper)

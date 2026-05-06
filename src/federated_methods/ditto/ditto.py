@@ -1,6 +1,7 @@
 from ..personalized.fedavg import PerFedAvg
 from ..ditto.ditto_client import DittoClient
 from ..ditto.ditto_server import DittoServer
+from utils.caching_utils import serialize_payload
 
 
 class Ditto(PerFedAvg):
@@ -18,11 +19,17 @@ class Ditto(PerFedAvg):
         self.client_args.extend([self.proximity])
 
     def get_communication_content(self, rank):
-        res_dict = super().get_communication_content(rank)
-        local_model = self.server.local_models[rank]
-        res_dict["local_model"] = (
-            {k: v.cpu() for k, v in local_model.items()}
-            if self.cur_round != 0 and local_model is not None
-            else self.server.global_model.state_dict()
-        )
-        return res_dict
+        content = super().get_communication_content(rank)
+        if self.cfg.federated_params.cache_client_state.enabled:
+            return content
+
+        if self.cur_round == 0:
+            local_model = content["serialized"]["update_model"]
+        else:
+            local_state = self.server.local_models[rank]
+            if local_state is None:
+                local_model = content["serialized"]["update_model"]
+            else:
+                local_model = serialize_payload(local_state)
+        content["serialized"] = {**content["serialized"], "local_model": local_model}
+        return content
